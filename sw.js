@@ -29,7 +29,7 @@ async function reloadOldPages() {
 }
 self.addEventListener('activate', e => {
   e.waitUntil(caches.keys().then(async keys => {
-    const old = keys.filter(k => (k.startsWith('nlag-') && k !== VERSION) || (k.startsWith('nlagtiles-') && k !== TILES));
+    const old = keys.filter(k => (k.startsWith('nlag-') && k !== VERSION) || k.startsWith('nlagtiles-'));   // tile cache off: free its space
     await Promise.all(old.map(k => caches.delete(k)));
     await self.clients.claim();
     if (old.length) reloadOldPages().catch(() => null);      // not awaited: the reload itself needs this worker active
@@ -80,7 +80,8 @@ self.addEventListener('fetch', e => {
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
   if (url.origin !== self.location.origin) {                  // cross-origin: straight to the network, except satellite-tile byte ranges
-    if (TILE_HOST.test(url.host) && req.headers.get('range')) e.respondWith(tileFetch(req, url));
+    // (Oct 6 2026: the tile cache below is switched off — per-piece cache reads/writes made builds ~2.5x slower on
+    //  Jaren's connection and the site's storage allowance is ~12 GB; kept for reference, not used)
     return;
   }
   if (req.mode !== 'navigate' && (req.cache === 'no-store' || req.cache === 'reload')) return;   // v18: the app's own update check (fetch sw.js no-store) goes to the network; a (hard) reload of the page still falls back to the cached copy offline
