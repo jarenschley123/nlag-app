@@ -35,11 +35,34 @@ self.addEventListener('activate', e => {
     if (old.length) reloadOldPages().catch(() => null);      // not awaited: the reload itself needs this worker active
   }));
 });
+// Oct 2026: shared satellite-tile cache. The zone and PI map engines read Sentinel-2 / Landsat images as byte ranges of
+// 10 km image tiles, so a 250 ac field downloads ~1 GB, and every field nearby downloads the same tiles again. Byte ranges
+// from the image hosts are kept here (key = host + path + range; the Planetary Computer access token in the query is
+// ignored) and handed back from disk the next time — the bytes are identical, so the maps are identical. Kept to a share
+// of the device's storage: when it grows past that, the cache is emptied and starts again.
+const TILES = 'nlagtiles-v1', TILE_HOST = /(^|\.)sentinel-cogs\.s3\.us-west-2\.amazonaws\.com$|^landsateuwest\.blob\.core\.windows\.net$|^sentinel2l2a01\.blob\.core\.windows\.net$|^naipeuwest\.blob\.core\.windows\.net$/;
+let tilePuts = 0;
+async function tileTrim() {
+  try { const est = await navigator.storage.estimate(), cap = Math.min((est.quota || 0) * 0.4, 25 * 1024 ** 3); if (est.usage > cap) await caches.delete(TILES); } catch (x) { /* no estimate: keep */ }
+}
+async function tileFetch(req, url) {
+  const range = req.headers.get('range'), key = `${self.registration.scope}__tiles/${url.host}${url.pathname}?r=${encodeURIComponent(range)}`;
+  let c = null; try { c = await caches.open(TILES); const hit = await c.match(key); if (hit) { const h = new Headers(hit.headers); return new Response(await hit.arrayBuffer(), { status: +(h.get('x-nlag-status') || 206), statusText: 'Partial Content', headers: h }); } } catch (x) { /* cache unavailable: network */ }
+  const res = await fetch(req);
+  if (c && (res.status === 206 || res.status === 200)) {
+    try { const body = await res.clone().arrayBuffer(), h = new Headers(); ['content-range', 'content-type', 'content-length', 'accept-ranges', 'etag', 'last-modified'].forEach(k => { const v = res.headers.get(k); if (v) h.set(k, v); }); h.set('x-nlag-status', String(res.status));
+      c.put(key, new Response(body, { status: 200, headers: h })).then(() => { if (++tilePuts % 300 === 0) tileTrim(); }).catch(() => null); } catch (x) { /* not cached */ }
+  }
+  return res;
+}
 self.addEventListener('fetch', e => {
   const req = e.request;
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
-  if (url.origin !== self.location.origin) return;            // cross-origin: straight to the network
+  if (url.origin !== self.location.origin) {                  // cross-origin: straight to the network, except satellite-tile byte ranges
+    if (TILE_HOST.test(url.host) && req.headers.get('range')) e.respondWith(tileFetch(req, url));
+    return;
+  }
   if (req.mode !== 'navigate' && (req.cache === 'no-store' || req.cache === 'reload')) return;   // v18: the app's own update check (fetch sw.js no-store) goes to the network; a (hard) reload of the page still falls back to the cached copy offline
   if (req.mode === 'navigate') {                               // the page: network first (get updates), cached copy offline
     // v18: cache: 'no-cache' = always ask the server (a cheap 304 when nothing changed). Before v18 this used the browser's
