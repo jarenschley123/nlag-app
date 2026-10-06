@@ -29,7 +29,7 @@ async function reloadOldPages() {
 }
 self.addEventListener('activate', e => {
   e.waitUntil(caches.keys().then(async keys => {
-    const old = keys.filter(k => k.startsWith('nlag-') && k !== VERSION);
+    const old = keys.filter(k => (k.startsWith('nlag-') && k !== VERSION) || (k.startsWith('nlagtiles-') && k !== TILES));
     await Promise.all(old.map(k => caches.delete(k)));
     await self.clients.claim();
     if (old.length) reloadOldPages().catch(() => null);      // not awaited: the reload itself needs this worker active
@@ -40,20 +40,40 @@ self.addEventListener('activate', e => {
 // from the image hosts are kept here (key = host + path + range; the Planetary Computer access token in the query is
 // ignored) and handed back from disk the next time — the bytes are identical, so the maps are identical. Kept to a share
 // of the device's storage: when it grows past that, the cache is emptied and starts again.
-const TILES = 'nlagtiles-v1', TILE_HOST = /(^|\.)sentinel-cogs\.s3\.us-west-2\.amazonaws\.com$|^landsateuwest\.blob\.core\.windows\.net$|^sentinel2l2a01\.blob\.core\.windows\.net$|^naipeuwest\.blob\.core\.windows\.net$/;
-let tilePuts = 0;
+const TILES = 'nlagtiles-v3', CH = 65536, TILE_HOST = /(^|\.)sentinel-cogs\.s3\.us-west-2\.amazonaws\.com$|^landsateuwest\.blob\.core\.windows\.net$|^sentinel2l2a01\.blob\.core\.windows\.net$|^naipeuwest\.blob\.core\.windows\.net$/;
+// files are cut into fixed 64 KB pieces, so different fields asking for overlapping spans of the same image share pieces
+let tilePuts = 0; const tileFlight = new Map();
 async function tileTrim() {
   try { const est = await navigator.storage.estimate(), cap = Math.min((est.quota || 0) * 0.4, 25 * 1024 ** 3); if (est.usage > cap) await caches.delete(TILES); } catch (x) { /* no estimate: keep */ }
 }
+const pieceKey = (url, i) => `${self.registration.scope}__tiles/${url.host}${url.pathname}/piece-${i}`;   // (not '#': the cache ignores the part after '#')
+async function piecesFromNetwork(req, url, c, i0, i1) {     // download pieces i0..i1 in one request; -> Map(i -> Uint8Array)
+  const r = await fetch(new Request(req.url, { headers: { Range: `bytes=${i0 * CH}-${(i1 + 1) * CH - 1}` }, mode: 'cors', credentials: 'omit' }));
+  const out = new Map(); if (r.status === 416) return out;
+  if (r.status !== 206) throw new Error('no range support');
+  const buf = new Uint8Array(await r.arrayBuffer());
+  for (let i = i0; i <= i1; i++) { const s = (i - i0) * CH; if (s >= buf.length) break; const part = buf.slice(s, Math.min(s + CH, buf.length)); out.set(i, part);
+    c.put(pieceKey(url, i), new Response(part, { headers: { 'x-len': String(part.length) } })).then(() => { if (++tilePuts % 2000 === 0) tileTrim(); }).catch(() => null); }
+  return out;
+}
 async function tileFetch(req, url) {
-  const range = req.headers.get('range'), key = `${self.registration.scope}__tiles/${url.host}${url.pathname}?r=${encodeURIComponent(range)}`;
-  let c = null; try { c = await caches.open(TILES); const hit = await c.match(key); if (hit) { const h = new Headers(hit.headers); return new Response(await hit.arrayBuffer(), { status: +(h.get('x-nlag-status') || 206), statusText: 'Partial Content', headers: h }); } } catch (x) { /* cache unavailable: network */ }
-  const res = await fetch(req);
-  if (c && (res.status === 206 || res.status === 200)) {
-    try { const body = await res.clone().arrayBuffer(), h = new Headers(); ['content-range', 'content-type', 'content-length', 'accept-ranges', 'etag', 'last-modified'].forEach(k => { const v = res.headers.get(k); if (v) h.set(k, v); }); h.set('x-nlag-status', String(res.status));
-      c.put(key, new Response(body, { status: 200, headers: h })).then(() => { if (++tilePuts % 300 === 0) tileTrim(); }).catch(() => null); } catch (x) { /* not cached */ }
-  }
-  return res;
+  const m = /^bytes=(\d+)-(\d+)$/.exec(req.headers.get('range') || ''); if (!m) return fetch(req);
+  const a = +m[1], b = +m[2], i0 = Math.floor(a / CH), i1 = Math.floor(b / CH);
+  try {
+    const c = await caches.open(TILES), got = new Map(), miss = [];
+    for (let i = i0; i <= i1; i++) { const hit = await c.match(pieceKey(url, i)); if (hit) got.set(i, new Uint8Array(await hit.arrayBuffer())); else miss.push(i); }
+    for (let k = 0; k < miss.length;) {                          // contiguous runs of missing pieces, one request each
+      let e = k; while (e + 1 < miss.length && miss[e + 1] === miss[e] + 1) e++;
+      const fk = `${url.host}${url.pathname}#${miss[k]}-${miss[e]}`; let p = tileFlight.get(fk);
+      if (!p) { p = piecesFromNetwork(req, url, c, miss[k], miss[e]).finally(() => tileFlight.delete(fk)); tileFlight.set(fk, p); }
+      for (const [i, v] of await p) got.set(i, v); k = e + 1;
+    }
+    const parts = []; let n = 0;                                // the bytes a..b (shorter at the end of the file, like the server)
+    for (let i = i0; i <= i1; i++) { const v = got.get(i); if (!v) break; const s = i === i0 ? a - i0 * CH : 0, e = Math.min(v.length, i === i1 ? b - i1 * CH + 1 : CH); if (e > s) { parts.push(v.subarray(s, e)); n += e - s; } if (v.length < CH) break; }
+    if (!n) return fetch(req);
+    const body = new Uint8Array(n); let o = 0; for (const p of parts) { body.set(p, o); o += p.length; }
+    return new Response(body, { status: 206, statusText: 'Partial Content', headers: { 'content-type': 'application/octet-stream', 'content-length': String(n) } });
+  } catch (x) { return fetch(req); }                            // anything odd: plain network, as before
 }
 self.addEventListener('fetch', e => {
   const req = e.request;
